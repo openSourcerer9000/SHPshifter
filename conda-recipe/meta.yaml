@@ -1,0 +1,30 @@
+package:
+  name: "SHPshifter"
+  version: "0.3.0"
+
+source:
+  # Relative path to the parent directory.
+  path: ..
+
+requirements:
+  host:
+    - python
+    - setuptools
+  build:
+    - python
+  run:
+    - python
+    - pandas
+    - requests
+    - cython
+
+about:
+  home: https://github.com/openSourcerer9000/SHPshifter
+  license: MIT
+  license_familY: MIT
+  license_file: LICENSE
+  summary: "Fills in some missing functionality from the Geopandas+Rioxarray GIS paradigm"
+
+extra:
+  recipe-maintainers:
+    - openSourcerer9000
