@@ -14,9 +14,9 @@ requirements:
     - python
   run:
     - python
-    - pandas
-    - requests
-    - cython
+    - funkshuns
+    - geocube
+    - scipy
 
 about:
   home: https://github.com/openSourcerer9000/SHPshifter

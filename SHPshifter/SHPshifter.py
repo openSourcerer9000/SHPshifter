@@ -1,10 +1,4 @@
-if __package__ is None or __package__ == '':
-    # uses current directory visibility
-    from atomic.SHPshifter import *
-else:
-    # uses current package visibility
-    from .atomic.SHPshifter import *
-    
+from funkshuns import *
 from pathlib import Path
 import pyproj
 
