@@ -1,4 +1,10 @@
-from funkshuns import *
+if __package__ is None or __package__ == '':
+    # uses current directory visibility
+    from atomic.funkshuns import *
+else:
+    # uses current package visibility
+    from .atomic.funkshuns import *
+    
 from pathlib import Path
 import pyproj
 
@@ -10,12 +16,50 @@ wgs84='EPSG:4326'
 
 try:
     import xarray as xr
-    import rioxarray
+    import rioxarray as rxr
 except Exception as e:
     if printImportWarnings:
         print('WARNING: ',e)
 from shapely.geometry import Point, LineString, mapping, MultiPoint, Polygon, box, shape
 from shapely import wkt
+
+from shapely.ops import substring, nearest_points
+from functools import partial
+
+reverse = partial(substring, start_dist=1, end_dist=0, normalized=True)
+def cut(line, distance,normalized=False):
+    ''' Cuts a line in two at a distance from its starting point\n
+    returns [segment0,semgent1]'''
+    if normalized:
+        distance=distance*line.length
+    if distance <= 0.0 or distance >= line.length:
+        return [LineString(line)]
+    coords = list(line.coords)
+    for i, p in enumerate(coords):
+        pd = line.project(Point(p))
+        if pd == distance:
+            return [
+                LineString(coords[:i+1]),
+                LineString(coords[i:])]
+        if pd > distance:
+            cp = line.interpolate(distance)
+            #cpt is [(cp.x, cp.y)] or [(cp.x, cp.y, cp.z)] etc depending on dims
+            cpt = list(cp.coords) 
+            return [
+                LineString(coords[:i] + cpt),
+                LineString(cpt + coords[i:])]
+def cutPiece(line,distance1, distance2,normalized=False):
+    """ From a linestring, this cuts a piece of length lgth at distance.\n
+    ie cutPiece(line,.1,.85,True) will cut a 10-85 from a LFP\n
+    ex:\n
+    gdf[g]=gdf[g].map(lambda line:shp.cutPiece(line,.1,.85,True))
+    """
+    if normalized:
+        distance1,distance2 = distance1*line.length,distance2*line.length
+    l1 = cut(line, distance1)[1]
+    l2 = cut(line, distance2)[0]
+    result = l1.intersection(l2)
+    return result
 def redistributeVertices(geom, distance):
     if geom.geom_type == 'LineString':
         num_vert = int(round(geom.length / distance))
@@ -30,6 +74,23 @@ def redistributeVertices(geom, distance):
         return type(geom)([p for p in parts if not p.is_empty])
     else:
         raise ValueError('unhandled geometry %s', (geom.geom_type,))
+def addZ(line,Z):
+    '''returns LineString Z with Z value from an iterable Z'''
+    coordz = np.array(LinetoList(line))
+
+    z = 'banana'
+    #case if Z is already a proper np array:
+    if isinstance(Z,np.ndarray):
+        try:
+            if Z.shape[1]==1:
+                z = Z
+        except:
+            pass
+    if not isinstance(z,np.ndarray): # not assigned in the special case above
+        z = np.array([Z]).T
+
+    c3 = np.concatenate([coordz,z],axis=1)
+    return LineString(c3)
 def LinetoList(myLineString,keepZ=False,emptyIsOK=True,noneIsOK=False):
     '''to ((x1,y1),(x2,y2),...)'''
     if myLineString is None:
@@ -67,57 +128,71 @@ def filterPts(line,n,byDist=False):
         res = LineString(res)
         return res
     else:
-        return LineString( [line.interpolate(i/n,normalized=True) for i in range(n)] )
-def substring(geom, start_dist, end_dist, normalized=False):
-    """available in shapely 1.7! shapely.ops.substring()\n
-    Return a line segment between specified distances along a linear geometry.
-    Negative distance values are taken as measured in the reverse
-    direction from the end of the geometry. Out-of-range index
-    values are handled by clamping them to the valid range of values.
-    If the start distances equals the end distance, a point is being returned.
-    If the normalized arg is True, the distance will be interpreted as a
-    fraction of the geometry's length.
-    """
-    assert(isinstance(geom, LineString))
-    # Filter out cases in which to return a point
-    if start_dist == end_dist:
-        return geom.interpolate(start_dist, normalized)
-    elif not normalized and start_dist >= geom.length and end_dist >= geom.length:
-        return geom.interpolate(geom.length, normalized)
-    elif not normalized and -start_dist >= geom.length and -end_dist >= geom.length:
-        return geom.interpolate(0, normalized)
-    elif normalized and start_dist >= 1 and end_dist >= 1:
-        return geom.interpolate(1, normalized)
-    elif normalized and -start_dist >= 1 and -end_dist >= 1:
-        return geom.interpolate(0, normalized)
-    start_point = geom.interpolate(start_dist, normalized)
-    end_point = geom.interpolate(end_dist, normalized)
-    min_dist = min(start_dist, end_dist)
-    max_dist = max(start_dist, end_dist)
-    if normalized:
-        min_dist *= geom.length
-        max_dist *= geom.length
-    if start_dist < end_dist:
-        vertex_list = [(start_point.x, start_point.y)]
+        return LineString( 
+            [line.interpolate(i/(n-1),normalized=True) for i in range(n)]
+            )
+# def substring(geom, start_dist, end_dist, normalized=False):
+#     """available in shapely 1.7! shapely.ops.substring()\n
+#     Return a line segment between specified distances along a linear geometry.
+#     Negative distance values are taken as measured in the reverse
+#     direction from the end of the geometry. Out-of-range index
+#     values are handled by clamping them to the valid range of values.
+#     If the start distances equals the end distance, a point is being returned.
+#     If the normalized arg is True, the distance will be interpreted as a
+#     fraction of the geometry's length.
+#     """
+#     assert(isinstance(geom, LineString))
+#     # Filter out cases in which to return a point
+#     if start_dist == end_dist:
+#         return geom.interpolate(start_dist, normalized)
+#     elif not normalized and start_dist >= geom.length and end_dist >= geom.length:
+#         return geom.interpolate(geom.length, normalized)
+#     elif not normalized and -start_dist >= geom.length and -end_dist >= geom.length:
+#         return geom.interpolate(0, normalized)
+#     elif normalized and start_dist >= 1 and end_dist >= 1:
+#         return geom.interpolate(1, normalized)
+#     elif normalized and -start_dist >= 1 and -end_dist >= 1:
+#         return geom.interpolate(0, normalized)
+#     start_point = geom.interpolate(start_dist, normalized)
+#     end_point = geom.interpolate(end_dist, normalized)
+#     min_dist = min(start_dist, end_dist)
+#     max_dist = max(start_dist, end_dist)
+#     if normalized:
+#         min_dist *= geom.length
+#         max_dist *= geom.length
+#     if start_dist < end_dist:
+#         vertex_list = [(start_point.x, start_point.y)]
+#     else:
+#         vertex_list = [(end_point.x, end_point.y)]
+#     coords = list(geom.coords)
+#     current_distance = 0
+#     for p1, p2 in zip(coords, coords[1:]):
+#         if min_dist < current_distance < max_dist:
+#             vertex_list.append(p1)
+#         elif current_distance >= max_dist:
+#             break
+#         current_distance += ((p2[0] - p1[0]) ** 2 + (p2[1] - p1[1]) ** 2) ** 0.5
+#     if start_dist < end_dist:
+#         vertex_list.append((end_point.x, end_point.y))
+#     else:
+#         vertex_list.append((start_point.x, start_point.y))
+#         # reverse direction result
+#         vertex_list = reversed(vertex_list)
+#     return LineString(vertex_list)
+
+def projectAll(geom,projectToGeom,normalized=False):
+    '''shapely project for all pts in geom\n
+    projectToGeom.project(geomPT0) for all pts'''
+    projek = lambda pt:projectToGeom.project(Point(pt),normalized=normalized)
+    if geom.type=='Polygon':
+        geom=geom.boundary
+    if geom.type=='LineString':
+        STAs = [ projek(pt) for pt in geom.coords]
     else:
-        vertex_list = [(end_point.x, end_point.y)]
-    coords = list(geom.coords)
-    current_distance = 0
-    for p1, p2 in zip(coords, coords[1:]):
-        if min_dist < current_distance < max_dist:
-            vertex_list.append(p1)
-        elif current_distance >= max_dist:
-            break
-        current_distance += ((p2[0] - p1[0]) ** 2 + (p2[1] - p1[1]) ** 2) ** 0.5
-    if start_dist < end_dist:
-        vertex_list.append((end_point.x, end_point.y))
-    else:
-        vertex_list.append((start_point.x, start_point.y))
-        # reverse direction result
-        vertex_list = reversed(vertex_list)
-    return LineString(vertex_list)
+        raise NotImplementedError(f'geom type {geom.type} not supported')
+    return STAs
+
 import geopandas as gpd
-from shapely.ops import nearest_points
 try:
     import rasterio
 except Exception as e:
@@ -130,6 +205,17 @@ except Exception as e:
     if printImportWarnings:
         print('WARNING: ',e)
 from shapely.geometry import Point
+try:
+    import topojson as tp
+except Exception as e:
+    if printImportWarnings:
+        print('WARNING: ',e)
+
+from shapely import wkb
+def dropZ(geom,output_dimension=2):
+    '''drops Z or more dims from shapely geo'''
+    return wkb.loads(wkb.dumps(geom, output_dimension=output_dimension))
+from shapely.ops import linemerge
 class gp():
     '''geopandas widgets\n
     multipart to singlepart gdf.explode()'''
@@ -158,6 +244,38 @@ class gp():
 
         gpdf_singlepoly.reset_index(inplace=True, drop=True)
         return gpdf_singlepoly
+    def dropZ(gdf,output_dimension=2):
+        gdf[g] = gdf[g].map(lambda geom:dropZ(geom,output_dimension=output_dimension))
+        return gdf
+    def toGeoJSON(vecpth,outGeoJSON,simplifyFt=70,quant=0.1,preserveTopo=False):
+        '''For webmappin\n
+        attempts to convert simplifyFt to meters or deg as needed, and simplifies vertices\n
+        converts to WGS 84\n
+        vecpth or GDF to outGeoJSON\n
+        returns the new GDF
+        '''
+
+        gdf = gp.asGDF(vecpth)
+        unitz = gp.getUnits(gdf.crs)
+        
+        simp = simplifyFt
+        if 'met' in unitz:
+            simp *= 0.3048
+        elif 'deg' in unitz:
+            simp /= 364567.2
+
+        if not preserveTopo:
+            gdf[g] = gdf.simplify(simp)
+            gdf=gdf.to_crs(wgs84)
+            gdf.to_file(outGeoJSON,driver='GeoJSON')
+        else:
+            gdf = gdf.to_crs('EPSG:4326')
+            simp = simplifyFt/364567.2
+
+            topo = tp.Topology(gdf, simplify_algorithm='vw', toposimplify=simp)#, topoquantize=0.00001)
+            topo.to_geojson(outGeoJSON)
+        print(f'Converted to {outGeoJSON}')
+        return gdf
     def to_json(GDF):
         '''
         returns serialized geojson str of GDF which can be parsed with gpd.read_file(geojsonString) \n
@@ -168,9 +286,13 @@ class gp():
             jsn = json.load(fh)
         return json.dumps(jsn)
     def getUnits(coors):
-        '''crs: pyproj.CRS (obtained w/ GDF.crs)\n
+        '''crs: pyproj.CRS (obtained w/ GDF.crs) or GDF or vec pth\n
         returns horizontal length unit in {'US survey foot',}'''
-        return coors.axis_info[0].unit_name
+        if not isinstance(coors,pyproj.CRS):
+            crrs = gp.asGDF(coors).crs
+        else:
+            crrs = coors
+        return crrs.axis_info[0].unit_name
     def to_coors(badGDF,newCoordsys):
         '''no longer needed as of gpd 0.9\n
         #why you need to do this, I absolutely don't know
@@ -248,7 +370,8 @@ class gp():
         profSeries = DF.apply(lambda df: LineString(eval(zyp)),axis=1)
         return profSeries
     def XYFromGeo(seriez,Xname='X',Yname='Y'):
-        '''returns a tuple of pd Series' (Xseries,Yseries), with the format of lists of floats [x1,x2,x3,...] \n
+        '''returns a tuple of pd Series' (Xseries,Yseries), 
+        with the format of lists of floats [x1,x2,x3,...] \n
         seriez: GeoSeries or column of shapely linestrings to convert\n
         Xname,Yname = str names for Xseries,Yseries\n
         exs:\n
@@ -285,37 +408,46 @@ class gp():
     def concat(geoSerieses,**kwargs):
         '''concats without losing CRS\n
         only tested for geoseries for now TODO gdfList'''
-        coors = geoSerieses[0].crs
+        geoz = [gg for gg in geoSerieses if gg is not None]
+        tstdiff = len(geoSerieses)-len(geoz)
+        if tstdiff:
+            print(f'Warning, {tstdiff} items not found in\n {geoSerieses}')
+            
+        coors = geoz[0].crs
         def crusade(ser):
             if ser.crs!=coors:
                 ser = ser.to_crs(coors)
             return ser
-        geoSerieses = [crusade(ser) for ser in geoSerieses]
+        geoz = [crusade(ser) for ser in geoz]
 
-        for ser in geoSerieses[1:]:
+        for ser in geoz[1:]:
             assert ser.crs==coors, 'Coordinate systems do not line up'
             
         # print('kwargs',kwargs)
-        isSeries = isinstance(geoSerieses[0],gpd.geoseries.GeoSeries) #TODO should check any or all?
-        cat = pd.concat(geoSerieses,**kwargs,   \
+        isSeries = isinstance(geoz[0],gpd.geoseries.GeoSeries) #TODO should check any or all?
+        cat = pd.concat(geoz,**kwargs,   \
             ignore_index=isSeries)
         cat.name='geometry'
         return gpd.GeoSeries(cat, crs=coors) if isSeries else gpd.GeoDataFrame(cat, crs=coors)
-    def nearest(gdfA, gdfB,k=1):
+    from scipy.spatial import cKDTree
+    from shapely.geometry import Point
+    def nearest(gdfA, gdfB,k=1,**queryKwargs):
         '''returns GeoDataFrame of \n
         k: # of nearest neighbors\n
         if CRS doesn't match, uses gdfB.to_crs(gdfA.crs) (doesn't actually change gdfB)\n
-        TODO fails if index(es) isn't range(len(gdA)) , fix this '''
-        from scipy.spatial import cKDTree
-        from shapely.geometry import Point
+        TODO fails if index(es) isn't range(len(gdA)) , fix this \n
         #TODO use centroid for polygons
+        queryKwargs get passed to KDTree.query\n
+        ie distance_upper_bound=10\n
+        https://docs.scipy.org/doc/scipy/reference/generated/scipy.spatial.KDTree.query.html
+        '''
         gdA = gdfA
         gdB = gdfB if (gdfA.crs==gdfB.crs) else gdfB.to_crs(gdfA.crs)
 
         nA = np.array(list(gdA.geometry.apply(lambda x: (x.x, x.y))))
         nB = np.array(list(gdB.geometry.apply(lambda x: (x.x, x.y))))
         btree = cKDTree(nB)
-        dist, idx = btree.query(nA, k=k)
+        dist, idx = btree.query(nA, k=k,**queryKwargs)
         if k==1:
             gdf = pd.concat(
                 [gdA.reset_index(drop=True), gdB.loc[idx, gdB.columns != 'geometry'].reset_index(drop=True),
@@ -326,11 +458,86 @@ class gp():
                     pd.Series(dist[:,col], name='dist')], axis=1)  for col in range(idx.shape[1]) ]
             gdf = pd.concat(alldfs,axis=0) #TODO should work gp.concat(alldfs,axis=0)
         return gdf
+    def joinAttrsByNearest(gdfA,gdfB,maxdist=1000,recursive=False,maxtries=10):
+        '''Join attrs from gdf_B to gdf_A one-to-one by "nearest" up to maxdist\n
+        if no neighbors found within maxdist for a feature, the feature's attrs will be NaN\n
+        datatypes can be whatever\n
+        if recursive: will start with maxdist, then double it until a match is found for all features\n
+        or maxTries exceeded
+        '''
+        gdf_A,gdf_B = gp.asGDF(gdfA),gp.asGDF(gdfB)
+
+        gdf_A['_idx_'] = range(len(gdf_A))
+        
+        B = gdf_B.copy()
+        B = B.to_crs(gdf_A.crs)
+        B[g] = B.buffer(maxdist)
+
+        xx = gpd.overlay(gdf_A,B,keep_geom_type=False)
+        if xx.type.iloc[0]=='Polygon':
+            xx['weightt']=xx.area
+        else: #linestring
+            xx['weightt']=xx.length
+        xx=xx.sort_values('weightt',ascending=False)
+        xx
+
+        xx=xx.groupby('_idx_').first().reset_index()
+        # xx=xx.drop(['_idx_','weightt'],axis=1)
+        xx
+        assert len(xx)<=len(gdf_A)
+        attrz = xx.columns[~xx.columns.isin(gdf_A.columns)].drop('weightt').to_list()
+        attrz
+        xx[attrz+['_idx_']]
+        mergd = gdf_A.merge(xx[attrz+['_idx_']],on='_idx_',how='left')
+        mergd
+        mergd = mergd.drop('_idx_',axis=1)
+
+        #clean up gdf A too as it added col to OG 
+        gdf_A = gdf_A.drop('_idx_',axis=1)
+        del B
+
+        if recursive:
+            joind = mergd
+
+            newcols = gdf_B.columns[~gdf_B.columns.isin(gdf_A.columns)]
+            newcol=newcols[0]
+            newcols
+            assert newcol in joind.columns and newcol not in gdf_A.columns
+            newcol
+            
+            i=2
+            while joind[newcol].isna().any():
+                if i>2**maxtries-1:
+                    raise f'max tries exceeded. Increase maxdist from {maxdist} or check your projection units'
+                print(f'expanding maxdist to {maxdist*i}')
+                nu = gp.joinAttrsByNearest(gdf_A,gdf_B,maxdist*i)
+                
+                joind[newcols] = joind[newcols].fillna(nu[newcols])
+                i *= 2
+            mergd = joind
+        return mergd
     def extractVerts(lineGeoSer):
         ''''''
         verts = lineGeoSer.apply(lambda ln: [Point(pt) for pt in ln.coords])
         verts = gp.concat([ gpd.GeoSeries(pts) for pts in verts ])
         return verts
+    def drape(gdf,demtif):
+        '''
+
+        '''
+        dem = rast.asRioxds(demtif)
+        Z = rast.sample(gdf,dem)
+
+        if gdf[g].type.iloc[0]=='LineString':
+            lines = gdf
+            lines['_zeee'] = Z
+            lines[g] = lines.apply(lambda line:
+                # line['_zeee']
+                addZ(line[g],line['_zeee'])
+                ,axis=1)
+            return lines.drop('_zeee',axis=1)
+        else:
+            raise NotImplementedError(f'geom of type {gdf[g].type.iloc[0]} not yet supported for shp.gp.drape')
     def getZ(x,aggFunc=False):
         '''gdf['z'] = gdf.geometry.apply(gp.getZ)
         use exterior and interior methods to extract the coordinates as tuples (x,y,z). \n
@@ -479,48 +686,257 @@ class gp():
         else:
             pts = gpd.GeoDataFrame(geometry=gpd.points_from_xy(x100,y100),crs=coors)
         return pts
+    def projekt(GDF,projectToGeom,normalized=False,how='nearest'):
+        '''returns pd series\n
+        shapely project should do according to docs but doesn't work with line projected to polygon\n\n
+        Returns the distance along the geom geometric object to a point nearest for each feature of GDF.\n
+        how in {'nearest','all', 'max','min','mean' or any other agg func}\n
+        mean, min, max find all pts and then return the mean, min, or max projected station\n
+        all returns all pts'''
+        gdf = gp.asGDF(GDF)
+
+        if how=='nearest':
+            nearpts = gdf[g].map(lambda geom:nearest_points(projectToGeom,geom)[-1])
+            nearpts
+
+            STAs = nearpts.map(lambda pt:
+                projectToGeom.project(pt,normalized=normalized))
+        else:
+            # all stations
+            STAz = gdf[g].map(lambda gg:projectAll(gg,projectToGeom,normalized=normalized))
+            STAz
+
+            if how == 'all':
+                return STAz
+            
+            STAs = STAz.map(lambda lst:pd.Series(lst).agg(how))
+
+        return STAs
     def assertPolygonAreasDontOverlap(gdf):
         # gs = gdf[g] if isinstance(gdf,gpd.GeoDataFrame) else gdf
         Asum = gdf.area.sum()
         Adis = gdf.dissolve().area.iloc[0]
         assert abs(Asum-Adis)<1, f'ERROR: soil type areas of {gdf.__name__} do not add up to the area of the whole, probably overlapping polygons'        
+    # def fixMultiLineString(row,snaptol=2):
+    #     '''
+    #     fixMultiLineStrings but for only 1 row
+    #     '''
+    #     raise NotImplementedError('fixMultiLineString doesnt work, shapely.ops.linemerge does it correctly.\nuse fixMultiLineStrings instead')
+    #     #all this nonsense below doesn't work, shapely.ops.linemerge does it correctly
+    #     strm = row
+    #     try:
+    #         splode = strm.explode()
+    #     except Exception as e:
+    #         print(row,'\n\n')
+    #         raise(e)
+
+    #     if isinstance(strm,pd.Series):
+    #         if g not in splode.index[splode.index.duplicated()]:
+    #             #handle whether this is being called from apply or from a 1 row gdf
+    #             #one linestring inside the multilinestring, our work here is done
+    #             strm[g] = splode[g]
+    #             return strm
+    #     elif isinstance(strm,gpd.GeoDataFrame):
+    #         if len(splode.drop(g,axis=1))==1:
+    #             #one linestring inside the multilinestring, our work here is done
+    #             strm[g] = splode[g].iloc[0]
+    #             return strm
+        
+    #     lns = splode[g].map(lambda geo:geo.coords)
+    #     lns
+    #     lns = lns.map(np.array)
+    #     lns
+    #     #drop Z, M, whatever
+    #     lns = lns.map(lambda aray:aray[:,:2])
+    #     lns
+    #     lns = pd.DataFrame({'coordz':lns.to_list()})
+    #     lns
+
+    #     lns['start'],lns['end'] = lns.coordz.str[0],lns.coordz.str[-1]
+    #     strt,end = np.array(lns.start.to_list()),np.array(lns.end.to_list())
+
+    #     lns['se'],lns['es'],lns['ss'],lns['ee'] = [ xnp.KDTreee(A,B,snaptol) 
+    #         for (A,B) in [(strt,end),(end,strt),(strt,strt),(end,end) ] ]
+    #     lns
+    #     trees = ['se','es','ss','ee']
+    #     lns[trees]=  lns[trees].replace(-1,np.NaN)
+        
+    #     lns.index = np.arange(len(lns))
+
+    #     #start and end segments
+    #     verts = lns[lns[trees].T.count()<2]
+    #     #start with 1st vert
+    #     v0 = verts.index[0]
+    #     v0
+    #     lne = lns.loc[[v0]]
+    #     lne
+    #     for _ in range(len(lns)-1):
+    #         #scrap current idx
+    #         lns[trees]=lns[trees].replace(lne.index[-1],np.nan)
+    #         lns[trees]
+    #         lns[trees]=lns[trees].replace(lne.index[-1],np.nan)
+    #         lastlne = lne[trees].iloc[-1]
+    #         lastlne
+    #         #get next idx
+    #         try:
+    #             i = int( lastlne.min() )#.astype(int)
+    #         except:
+    #             print('WARNING: Could not find 1 continuous linestring for feature:')
+    #             print(strm,'\n')
+    #             print(lns,'\n')
+    #             print(lne.iloc[-1])
+    #             return strm
+    #         i
+    #         if lastlne[lastlne==i].index[0] in ['ee','ss']:# the next one is flipped
+    #             # print(i)
+    #             # print(lns.loc[i,'start'],lns.loc[i,'end'])
+    #             #flip it back
+    #             # must wrap the Data Frame data args in square brackets to maintain the np.array in each cell:
+    #             # print(lns.loc[i,'coordz'])
+    #             lns.loc[i,'coordz'] = [ lns.loc[i,'coordz'][::-1] ]
+    #             # print(lns.loc[i,'coordz'])
+    #             # lns
+    #             lns['start'],lns['end'] = lns.coordz.str[0],lns.coordz.str[-1]
+    #             lns
+    #             # print(lns.loc[i,'end'],lns.loc[i,'start'])
+
+    #             #reparse trees
+    #             strt,end = np.array(lns.start.to_list()),np.array(lns.end.to_list())
+    #             lns['se'],lns['es'],lns['ss'],lns['ee'] = [ xnp.KDTreee(A,B,snaptol) 
+    #                 for (A,B) in [(strt,end),(end,strt),(strt,strt),(end,end) ] ]
+    #             lns[trees]=  lns[trees].replace(-1,np.NaN)
+
+    #             #re-scrap indeces
+    #             lns[trees]=lns[trees].replace({idx:np.nan for idx in lne.index.to_list()})
+    #         lne = lne.append(lns.loc[[i]])
+    #     lne
+
+    #     pts = np.concatenate(lne.coordz.to_list())
+    #     strm[g]= LineString(pts).simplify(0)
+
+    #     return strm
+    def fixMultiLineStrings(GDF):
+        '''
+        GDF: gdf of MultiLineStrings which were dissolved from separate LineStrings,\n
+        The linestrings are connected end to end as a continuous line, but
+        during dissolve they got screwed up, out of order, some are drawn backwards\n
+        returns GDF where each feat's geo is corrected to a single, continuous LineString
+        '''
+        coors = GDF.crs
+        GDF.loc[GDF.type=='MultiLineString',g] = GDF.loc[GDF.type=='MultiLineString',g].map(linemerge)
+        assert coors == GDF.crs, f'{GDF.crs} does not match {coors}'
+        return GDF
+
+        # return GDF.apply( lambda row:gp.fixMultiLineString(row,snaptol=snaptol),
+        #     axis=1)
+    def checkLineOrientationUStoDS(lineGDF,dem,DStoUSinstead=False):
+        '''returns a series of whether or not each line in lineGDF is oriented US to DS'''
+        lineGDF = gp.fixMultiLineStrings(lineGDF)
+
+        assert (lineGDF.type=='LineString').all()
+
+        lns = lineGDF
+        endz = lns[[g]]
+        endz[g] = endz[g].map(lambda geo:LineString([geo.coords[0],geo.coords[-1]]))
+
+        rioxda = rast.asRioxds(dem)
+        rioxda
+
+        Z = rast.sample(endz,rioxda)
+        
+        oriented = Z.str[0]>Z.str[-1]
+        if DStoUSinstead:
+            oriented = ~oriented
+        oriented.name = 'DStoUS' if DStoUSinstead else 'UStoDS'
+        return oriented
+
+    def orientLinesUStoDS(lineGDF,dem,DStoUSinstead=False):
+        rioxda = rast.asRioxds(dem) # just avoid reading twice
+        oriented = gp.checkLineOrientationUStoDS(lineGDF,rioxda,DStoUSinstead)
+
+        lineGDF.loc[~oriented,g] = lineGDF.loc[~oriented,g].map(reverse)
+
+        reoriented = gp.checkLineOrientationUStoDS(lineGDF,rioxda,DStoUSinstead)
+        assert reoriented.all(), reoriented.value_counts()
+
+        return lineGDF
+
+
 
 class rast():
-    def asRioxds(rioxdsORtifpth,**kwargs):
-        if isinstance(rioxdsORtifpth,PurePath):
-            # with rioxarray.open_rasterio(tifpth) as fid:
+    def asRioxda(rioxdaORtifpth,**kwargs):
+        if isinstance(rioxdaORtifpth,PurePath):
+            # with rxr.open_rasterio(tifpth) as fid:
             #     imp=fid
-            return rioxarray.open_rasterio(rioxdsORtifpth,**kwargs)
-        elif isinstance(rioxdsORtifpth,xr.DataArray):
-            return rioxdsORtifpth
+            return rxr.open_rasterio(rioxdaORtifpth,**kwargs)
+        elif isinstance(rioxdaORtifpth,xr.DataArray):
+            return rioxdaORtifpth
         else:
-            print(f'WARNING:\n {rioxdsORtifpth}\n identified as type {type(rioxdsORtifpth)}, not rioxarray dataarray or TIF Path')
+            print(f'WARNING:\n {rioxdaORtifpth}\n identified as type {type(rioxdaORtifpth)}, not rioxarray dataarray or TIF Path')
             # raise TypeError(f'Please supply in the form of ')
+    asRioxds = asRioxda #alias
+    def sample(gdf,rioxda,xydims=('x','y')):
+        '''gdf or geoseries\n
+        xydims correspond to rioxda x,y\n
+        if gdf is Point type:\n
+            returns np array of sampled Z values \n
+        if LineString or Polygon:\n
+            returns Series of arrays corresponding to Z values at each vertex\n
+            TODO inner rings of polygons, uses just boundary\n
+            TODO just returns first band of raster'''
+        def _sampleDA(rioxda,gdf,xydims=('x','y')):
+            '''returns new da with dim pt and coord vars x,y'''
+            pts = gdf[g] if isinstance(gdf,gpd.GeoDataFrame) else gdf
+                
+            x,y = xydims
+            xyz = rioxda.sel( {'x':xr.DataArray(pts.x, dims='pt'), 
+                    'y':xr.DataArray(pts.y, dims='pt')}, 
+                    method='nearest')
+            xyz = xyz.isel(band=0) if 'band' in xyz.dims else xyz
+            return xyz
+
+
+        rioxda = rast.asRioxda(rioxda)
+        gdf = gdf.to_crs(rioxda.rio.crs)
+        pts = gdf[g].copy() if isinstance(gdf,gpd.GeoDataFrame) else gdf.copy()
+
+        if pts.type.iloc[0]=='Point':
+            return _sampleDA(rioxda,pts,xydims).values
+        if pts.type.iloc[0]=='Polygon':
+            pts = pts.boundary
+        if pts.type.iloc[0]=='LineString':
+            pts = pts.map(lambda line:np.array(line.coords))
+
+        pts = pts.map(lambda pt: gpd.GeoSeries(gpd.points_from_xy(pt[:,0],pt[:,1])) )
+        z = pts.map(lambda gs: _sampleDA(rioxda,gs,xydims).values)
+        z.name = 'Z'
+        return z
     def ZgivenXY(linestrng,rasta):
-        '''returns an np array of Z vals given a linestring'''
+        '''returns an np array of Z vals given a linestring
+        rasta is .tif Path, reads in with xarray'''
         lyne = LinetoList(linestrng)
         with rasterio.open(rasta,bigtiff='YES') as rst:
             Z = np.array([z[0] for z in rst.sample(lyne)])
         return Z
-    def valcounts(rioxds,clipGDF,**kwargs):
-        '''returns pd DF of value counts for region of rioxds raster within clipGDF (gpd gdf)\n
+    def valcounts(rioxda,clipGDF,**kwargs):
+        '''returns pd DF of value counts for region of rioxda raster within clipGDF (gpd gdf)\n
         returned DF index: 'Value', cols: ['cnt','pct'] \n
         -not tried on multiband #TODO\n
-        rioxds: raster as rioxarray data array\n
-        **kwargs get passed through to rioxds.rio.clip\n
+        rioxda: raster as rioxarray data array\n
+        **kwargs get passed through to rioxda.rio.clip\n
         '''
-        # print('rioxds',type(rioxds))
-        # print(rioxds)
+        # print('rioxda',type(rioxda))
+        # print(rioxda)
         # print(type(clipGDF))
         # print(clipGDF)
         
         try:
             clipper = clipGDF.copy()#['geometry'] #TODO which?
-            ds_clpd = rioxds.rio.clip(clipper,**kwargs)
+            ds_clpd = rioxda.rio.clip(clipper,**kwargs)
         except Exception as e:
             print(f'WARNING: \n{e}')
             clipper = clipGDF.copy()[['geometry']] #TODO which?
-            ds_clpd = rioxds.rio.clip(clipper,**kwargs)
+            ds_clpd = rioxda.rio.clip(clipper,**kwargs)
         
         valcounts = np.array(np.unique(ds_clpd.values, return_counts=True)).T
         valcounts = pd.DataFrame(valcounts,columns=['Value','cnt'])
@@ -536,38 +952,41 @@ class rast():
         assert np.isclose(valcounts['pct'].sum(),1)
         
         return valcounts.set_index('Value')
-    def setNodataAsNaN(rioxds):
-        '''rioxds'''
-        if hasattr(rioxds,'_FillValue'):
-            print()
-            rioxds = rioxds.where(rioxds != rioxds.attrs['_FillValue'])
-        rioxds.attrs['_FillValue']=np.NaN
-        rioxds = rioxds.where(rioxds != np.NaN)
-        return rioxds
+    def setNodataAsNaN(rioxdaOrTIFpth):
+        '''returns rioxda
+        '''
+        rioxda = rast.asRioxda(rioxdaOrTIFpth)
+        if hasattr(rioxda,'_FillValue'):
+            rioxda = rioxda.where(rioxda != rioxda.attrs['_FillValue'])
+        rioxda.attrs['_FillValue']=np.NaN
+        rioxda = rioxda.where(rioxda != np.NaN)
+        return rioxda
     def cleanNodata(tif,minn,maxx):
-        '''tif as rioxds or Path\n
+        '''tif as rioxda or Path\n
         minn, maxx inclusive'''
-        imp = rast.asRioxds(tif)
+        imp = rast.asRioxda(tif)
         imp = imp.where(imp>=minn).where(imp<=maxx)
         imp = rast.setNodataAsNaN(imp)
         return imp
-    def checkBounds(rioxds,minn,maxx):
-        assert minn<=float(rioxds.min()), f'ERROR: min {float(rioxds.min())} outside lower bound of {minn}'
-        assert maxx>=float(rioxds.max()), f'ERROR: max {float(rioxds.max())} outside upper bound of {maxx}'
+    def checkBounds(rioxda,minn,maxx):
+        assert minn<=float(rioxda.min()), f'ERROR: min {float(rioxda.min())} outside lower bound of {minn}'
+        assert maxx>=float(rioxda.max()), f'ERROR: max {float(rioxda.max())} outside upper bound of {maxx}'
     # @timeit
-    def clip(rioxds,clipGDF,stripNAs=True):
+    def clip(rioxda,clip_GDF,stripNAs=True):
         '''
-        rioxds: raster as rioxarray ds\n
+        rioxda: raster as rioxarray ds\n
         clipGDF: polygon GDF (or series TODO) to clip w/\n
         output ZvarName='z'\n
         if stripNAs: subset the result to remove null values based on (band 1?)'s '_FillValue' attr
         '''
         # print('..')
-        # # print(rioxds.rio.crs.wkt)
+        # # print(rioxda.rio.crs.wkt)
         # print('...')
-        rastCRS = rioxds.rio.crs
-        # rastCRS = pyproj.CRS.from_user_input(rioxds.rio.crs)
-        # rastCRS = f'EPSG:{pyproj.CRS.from_wkt(rioxds.rio.crs.wkt).to_epsg()}'
+        rioxda = rast.asRioxda(rioxda)
+        clipGDF = gp.asGDF(clip_GDF)
+        rastCRS = rioxda.rio.crs
+        # rastCRS = pyproj.CRS.from_user_input(rioxda.rio.crs)
+        # rastCRS = f'EPSG:{pyproj.CRS.from_wkt(rioxda.rio.crs.wkt).to_epsg()}'
         # print('there:')
         clipDissolved = clipGDF.dissolve().to_crs(rastCRS)
         # print(clipDissolved.crs)
@@ -577,15 +996,15 @@ class rast():
         
         x,y = xybbox[:,0],xybbox[:,1]
         
-        # print(rioxds.rio.bounds())
-        rastbnds = box(*rioxds.rio.bounds())
-        assert Polygon(xybbox).within(rastbnds), f'ERROR: areaGDF does not lie within bounds of rioxds raster\n\n{clipGDF}, \nPossible projection issue\nrioxdstif crs: {rastCRS}\nGDF crs: {clipGDF.crs}'
+        # print(rioxda.rio.bounds())
+        rastbnds = box(*rioxda.rio.bounds())
+        assert Polygon(xybbox).overlaps(rastbnds), f'ERROR: areaGDF does not lie within bounds of rioxda raster\n\n{clipGDF}, \nPossible projection issue\nrioxdatif crs: {rastCRS}\nGDF crs: {clipGDF.crs}'
         
-        # rioxds.rio.write_nodata(128, inplace=True)
-        # rioxds['nodatavals'] = (128)
+        # rioxda.rio.write_nodata(128, inplace=True)
+        # rioxda['nodatavals'] = (128)
         # print('wrote')
         # print([min(x),min(y), max(x),max(y)])
-        ds_clp = rioxds.rio.clip_box(minx=min(x), miny=min(y), maxx=max(x), maxy=max(y),auto_expand=True)
+        ds_clp = rioxda.rio.clip_box(minx=min(x), miny=min(y), maxx=max(x), maxy=max(y),auto_expand=True)
         ds_clp
         
         try:
@@ -595,8 +1014,8 @@ class rast():
             #if it's too big to fit in mem
             clipdTerr = ds_clp.rio.clip(clipDissolved[g].apply(mapping),ds_clp.rio.crs,from_disk=True) 
 
-        # print(clipdTerr.attrs == rioxds.attrs)
-        clipdTerr.attrs = rioxds.attrs #doesn't seem to be necessary with current xr version but may change later
+        # print(clipdTerr.attrs == rioxda.attrs)
+        clipdTerr.attrs = rioxda.attrs #doesn't seem to be necessary with current xr version but may change later
 
         if stripNAs:
             clipdTerr=clipdTerr.where(clipdTerr != clipdTerr.attrs['_FillValue'])
@@ -650,29 +1069,29 @@ class rast():
         #                            crs=crs)
         return data_gs
     @timeit
-    def vectorize(rioxds,rasterioFlipErr,ZvarName='z',contours='dynamic',zmin='fromRaster',zmax='fromRaster',smoothness=5,smoothres=2):
+    def vectorize(rioxda,rasterioFlipErr,ZvarName='z',contours='dynamic',zmin='fromRaster',zmax='fromRaster',smoothness=5,smoothres=2):
         '''rioxarray ds to geopandas gdf\n
         sleek, performant, and sexy\n
-        rioxds: raster as rioxarray ds\n
+        rioxda: raster as rioxarray ds\n
         vectorizes to polygons at different contours, then smooths result based on the raster gridsize * smoothness\n
         rasterioFlipErr = True to correct for a rasterio bug that flips the vectorized result\n
         ZvarName: variable for raster band to vectorize on (not tested where ds has >1 var)\n
 
         '''
-        # rastCRS = pyproj.CRS.from_wkt(rioxds.rio.crs.wkt)
-        rastCRS = f'EPSG:{pyproj.CRS.from_wkt(rioxds.rio.crs.wkt).to_epsg()}'
-        # = pyproj.CRS.from_user_input(rioxds.rio.crs) #in GDF-ready format
+        # rastCRS = pyproj.CRS.from_wkt(rioxda.rio.crs.wkt)
+        rastCRS = f'EPSG:{pyproj.CRS.from_wkt(rioxda.rio.crs.wkt).to_epsg()}'
+        # = pyproj.CRS.from_user_input(rioxda.rio.crs) #in GDF-ready format
         print(rastCRS)
-        gridsize = int(np.mean(np.abs(np.array(rioxds.rio.resolution()))))
+        gridsize = int(np.mean(np.abs(np.array(rioxda.rio.resolution()))))
         print('gridsize:',gridsize)
         minArea = (gridsize*smoothness)**2 #of polygons
         
         if contours=='dynamic':
-            zrealmax = float(rioxds[ZvarName].max().values)
+            zrealmax = float(rioxda[ZvarName].max().values)
             if zmax=='fromRaster':
                 zmax = zrealmax
             if zmin=='fromRaster':
-                zmin = float(rioxds[ZvarName].min().values)
+                zmin = float(rioxda[ZvarName].min().values)
             #total contours under 50
             # band 1 |cutoff2| band 2 at step2 |cutoff3| band 3 at step3
             #1st band len 20, 2nd band len 20, 3rd band len 10
@@ -691,7 +1110,7 @@ class rast():
 
         if rasterio.__version__ == '1.2.4':
             rasterioFlipErr=True
-        transform = rioxds.rio.transform()
+        transform = rioxda.rio.transform()
         print(transform)
         if rasterioFlipErr:
             a,e = 0,0
@@ -711,7 +1130,7 @@ class rast():
         vecs = []
         for i,zthresh in enumerate(contours):
             nowe = datetime.now()
-            rmask = rast.masq(rioxds,zthresh)
+            rmask = rast.masq(rioxda,zthresh)
             vec = rast.vectorize1(rmask[ZvarName],zthresh,afine,crs=rastCRS)
             # print(len(vec))
             vec = vec[vec.area > minArea]
@@ -891,7 +1310,7 @@ class rast():
         return urls
     def zonalXY(tifpth,vecpth,outtif):
         ''''''
-        tif = rioxarray.open_rasterio(tifpth)
+        tif = rxr.open_rasterio(tifpth)
         tif
         
         bldgs = gpd.read_file(vecpth)
@@ -915,7 +1334,7 @@ class rast():
         
         
         
-        mrg = rioxarray.merge.merge_arrays(mins)
+        mrg = rxr.merge.merge_arrays(mins)
         mrg
         
         # mrg.plot()
@@ -925,6 +1344,58 @@ class rast():
         mrg.rio.to_raster(outtif)
         print(f'Result bounced to {outtif}')
     # def getTNRISLiDAR(regionShp,toPth):
+try:
+    import regionmask
+except Exception as e:
+    if printImportWarnings:
+        print('WARNING: ',e)
+        print('Optional dependency for clipping ND datasets: shp.nd.clip')
+class nd():
+    def clip(ds,clipVec):
+        '''nd dataset, must have latitude, longitude dims'''
+        print('✂️ Clip to region ✂️')
+
+        g='geometry'
+        gdf = gp.asGDF(clipVec)
+        
+        reg = gdf.to_crs('EPSG:4326').dissolve()[g].iloc[0]
+
+        reg4 = regionmask.Regions([reg],name='Region',names=['region'])
+        # reg4.plot(label="abbrev")
+
+        mask=reg4.mask(ds.longitude,ds.latitude)
+
+        clpd = ds.where(mask==0)
+
+        assert len(clpd.where(clpd.depth!= np.NaN).latitude)>0, f'ERROR: data outside of clip mask {clipVec}'
+
+
+        xmin,ymin,xmax,ymax = reg.bounds
+
+        wraplon = lambda lon:lon if lon>0 else lon+360
+
+        xmin,xmax=[wraplon(x) for x in (xmin,xmax)]
+
+        #regionmask leaves the same boundary of NaNs, perform bbox clip:
+        clpd = clpd.sortby('longitude').sel(longitude=slice(xmin,xmax)).sortby('latitude').sel(latitude=slice(ymin,ymax))
+
+        # try:
+        #     # Still not implemented:
+        #     clpd=clpd.sel(longitude=slice(xmin,xmax),latitude=slice(ymin,ymax),method='nearest')
+        # except:
+        #     clpd = clpd.sortby('longitude').sel(longitude=slice(xmin,xmax)).sortby('latitude').sel(latitude=slice(ymin,ymax))
+        # clpd
+
+        # clpd=clpd.dropna('longitude',how='all').dropna('latitude',how='all')
+        # progress(clpd)
+        if 'time' in ds.dims:
+            clpd=clpd.chunk({'time':1,'latitude':-1,'longitude':-1})
+
+        # forplot = downsamp(clpd)
+        # forplot.depth.plot(robust=True)
+
+        print(f'Clipped size decreased to {np.round(np.abs(clpd.nbytes/ds.nbytes)*100,1)}% of original')
+        return clpd
 
 class xzib():
     '''QGIS exhibit utils'''
