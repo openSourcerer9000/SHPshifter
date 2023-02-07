@@ -1,9 +1,4 @@
-if __package__ is None or __package__ == '':
-    # uses current directory visibility
-    from atomic.funkshuns import *
-else:
-    # uses current package visibility
-    from .atomic.funkshuns import *
+from funkshuns import *
     
 from pathlib import Path
 import pyproj
@@ -22,6 +17,7 @@ except Exception as e:
         print('WARNING: ',e)
 from shapely.geometry import Point, LineString, mapping, MultiPoint, Polygon, box, shape
 from shapely import wkt
+import shapely
 
 from shapely.ops import substring, nearest_points
 from functools import partial
@@ -29,10 +25,16 @@ from functools import partial
 reverse = partial(substring, start_dist=1, end_dist=0, normalized=True)
 def cut(line, distance,normalized=False):
     ''' Cuts a line in two at a distance from its starting point\n
-    returns [segment0,semgent1]'''
+    returns [segment0,semgent1]\n\n
+    if distance <= 0.0 or distance >= line.length:\n
+        return [LineString(line)]'''
     if normalized:
         distance=distance*line.length
-    if distance <= 0.0 or distance >= line.length:
+    if distance==0.0:
+        return [None,LineString(line)]
+    if distance==line.length:
+        return [LineString(line),None]
+    if distance < 0.0 or distance > line.length:
         return [LineString(line)]
     coords = list(line.coords)
     for i, p in enumerate(coords):
@@ -57,8 +59,10 @@ def cutPiece(line,distance1, distance2,normalized=False):
     if normalized:
         distance1,distance2 = distance1*line.length,distance2*line.length
     l1 = cut(line, distance1)[1]
-    l2 = cut(line, distance2)[0]
-    result = l1.intersection(l2)
+    result = cut(l1, distance2-distance1)[0]
+    # l2 = cut(line, distance2)[0]
+    # result = l1.intersection(l2)
+    assert isinstance(result,LineString), f'INTERNAL ERROR: {result} is not LineString, problem with cutPiece function'
     return result
 def redistributeVertices(geom, distance):
     if geom.geom_type == 'LineString':
@@ -216,6 +220,9 @@ def dropZ(geom,output_dimension=2):
     '''drops Z or more dims from shapely geo'''
     return wkb.loads(wkb.dumps(geom, output_dimension=output_dimension))
 from shapely.ops import linemerge
+from geopandas.testing import assert_geodataframe_equal
+
+
 class gp():
     '''geopandas widgets\n
     multipart to singlepart gdf.explode()'''
@@ -224,10 +231,17 @@ class gp():
             # if GDF_or_Path.suffix=='.shp':
             return gpd.read_file(GDF_or_Path,**kwargs)
         else:
-            return GDF_or_Path
+            return GDF_or_Path.copy()
     def stillGDF(hopefullyGDF):
         assert isinstance(hopefullyGDF,gpd.GeoDataFrame)
         assert hopefullyGDF.crs
+    def assertGDFequal(GDF_A,GDF_B,colOrderIrrelevent=True,**kwargs):
+        '''GDF or vec file'''
+        gdfA,gdfB = gp.asGDF(GDF_A),gp.asGDF(GDF_B)
+        if colOrderIrrelevent:
+            assert set(gdfB.columns)==set(gdfA.columns)
+            gdfB = gdfB[gdfA.columns]
+        assert_geodataframe_equal(gdfA,gdfB,**kwargs)
     def mingle(gpdf):
         '''multipart to singlepart'''
         gpdf_multipoly = gpdf[gpdf.geometry.type.str.startswith('Multi')]
@@ -244,6 +258,42 @@ class gp():
 
         gpdf_singlepoly.reset_index(inplace=True, drop=True)
         return gpdf_singlepoly
+    def bbox(gdf,ret='box'):
+        '''finds bbox of gdf (or geoseries)
+        \nreturns shapely.geometry.box if ret=='box', GDF if ret=='gdf', or geoseries otherwise'''
+        GDF = gpd.GeoDataFrame(geometry=gdf,crs=gdf.crs) if isinstance(gdf,gpd.GeoSeries) else gdf.copy()
+        bnds = list(GDF.dissolve().bounds.iloc[0])
+        bbx = box(*bnds)
+        if ret.lower()=='box':
+            return bbx
+        elif ret.lower()=='gdf':
+            return gpd.GeoDataFrame(geometry=[bbx],crs=gdf.crs)
+        else:
+            return gpd.GeoSeries([bbx],crs=gdf.crs)
+    @timeit
+    def voronoi(pts,perim):
+        '''
+        returns pts Point GDF with geom replaced by voronoi polygons, bounded by perim polygon/multipolygon GDF\n
+        inputs as vec Path or GDF's TODO np array, shapely polygon
+        '''
+        assert int(shapely.__version__[0])>=2, f'Shapely v2.0 or greater required to use voronoi polygons, please upgrade.\nYour envs version: {shapely.__version__}'
+        coordz = gp.asGDF(pts)
+        perimm = gp.asGDF(perim).to_crs(coordz.crs).dissolve()
+        
+        ptz = coordz[g].to_list()
+        mpt = MultiPoint(ptz)
+
+        voro = shapely.voronoi_polygons(mpt
+            # ,extend_to=perim[g].iloc[0] DON'T WORK
+            )
+        del ptz,mpt
+
+        coordz[g]=voro.geoms
+        del voro
+        assert (coordz.type=='Polygon').all()
+        
+        cellz = coordz.clip(perimm)
+        return cellz
     def dropZ(gdf,output_dimension=2):
         gdf[g] = gdf[g].map(lambda geom:dropZ(geom,output_dimension=output_dimension))
         return gdf
@@ -327,15 +377,17 @@ class gp():
         if joyn:
             dists = GDF.join(dists)
         return dists
-    def FilterPts(inLines,n,filterbyattr=None,outShapefile=None):
+    def FilterPts(linegdf,n,filterbyattr=None,outShapefile=None):
         '''edits inLines <inplace??? not used like that below> (Path obj -or- geodataframe/geoseries) of linestrings to have n pts \n
         and writes to outShapefile if specified\n
         Returns geodataframe \n
         filterbyattr = expression to evaluate as str: ex: "['Type']=='Lateral'" TODO (UPGRADE THAT WITH PD QUERY)
         '''
-        if isinstance(inLines, PurePath):
-            if inLines.suffix=='.shp':
-                inLines = gpd.read_file(inLines)
+
+        if isinstance(linegdf, PurePath):
+            # if inLines.suffix=='.shp':
+            linegdf = gpd.read_file(linegdf)
+        inLines = linegdf.copy()
         isGDF = type(inLines) == gpd.GeoDataFrame
         if filterbyattr:
             inLines = inLines[eval('inLines' + filterbyattr)]
@@ -353,6 +405,15 @@ class gp():
         if outShapefile:
             inLines.to_file(outShapefile)
         return inLines
+    # def extractVerts(gdf):
+    #     '''
+    #     Extracts vertices of 
+            # TODO mirror the QGIS behavior?
+    #     '''
+    #     xy = np.array(gdf[g].iloc[0].coords)
+    #     xy
+    #     pts = gpd.GeoSeries(gpd.points_from_xy(xy[:,0],xy[:,1]),crs=gdf.crs)
+    #     return pts
     def geoFromXY(DF,Xcol,Ycol):
         '''TODO this is already a gpd method??\n
         Converts DF cols 'Xcol' and 'Ycol' (columns are as lists of floats [x1,x2,x3,...])\n
@@ -671,7 +732,7 @@ class gp():
         if dropXYcols:
             gdf = gdf.drop(['X','Y'],axis=1)
         return gdf
-    def randPts(n,ret='geoseries',rangex=5000,rangey=5000,seedx=0,seedy=0,leftbound = (3020837,13595634),coors='epsg:6588'):
+    def randPts(n=100,ret='geoseries',rangex=5000,rangey=5000,seedx=0,seedy=0,leftbound = (3020837,13595634),coors='epsg:6588'):
         '''returns Geoseries (or GDF) of pseudorandom pts\n
         great for testing, use with buffer to make polygons\n
         ret!='geoseries' will return a GDF'''
@@ -1343,6 +1404,70 @@ class rast():
         
         mrg.rio.to_raster(outtif)
         print(f'Result bounced to {outtif}')
+
+    def burnStrucsInTerrain(barrelsGDF,terrainTIF,outTIF,
+                                clipvec =None,
+                                spanCol='Span',
+                                sampmargin=10,buffmargin=0.3,dropmargin=0):
+        '''
+        
+        '''
+        brlz = barrelsGDF
+        
+        if clipvec:
+            clp=gp.asGDF(clipvec)
+            clp=clp.to_crs(brlz.crs)
+            brlz = gpd.sjoin(brlz,clp[[g]])
+        
+        def _buffOut(brl):
+            brl[g]=brl[g].buffer(brl[spanCol]/2+buffmargin)
+            return brl
+        
+        brlbuff = brlz.apply(_buffOut,axis=1)
+        brlbuff.plot()
+        
+        dem = rast.asRioxda(terrainTIF)
+        
+        bigbuff = brlz.buffer(sampmargin)
+        
+        samp = rast.sample(bigbuff,dem)
+        
+        Z1 = samp.map(min)
+        endz = rast.sample(brlz,dem)
+        Z2 = endz.map(min)
+        Z = pd.concat([Z1,Z2],axis=1).min(axis=1)
+        
+        
+        brlbuff['Zmin'] = Z-dropmargin
+        brlbuff
+        
+        burner = brlbuff.reset_index()[['Zmin',g]]
+        burner
+        
+        assert burner.crs
+        
+        res = dem.rio.resolution()
+        res
+        
+        #resolution (Union[float, Iterable[float]], optional) 
+        #  A tuple of the spatial resolution of the returned data (Y, X).
+        #  This includes the direction (as indicated by a positive or negative number).
+        #  Typically when using most CRSs, the first number would be negative.
+        res = ( -abs(res[0]) , abs(res[1]) )
+        res
+        
+        from geocube.api.core import make_geocube
+        
+        out_grid = make_geocube(
+            vector_data=burner,
+            # measurements=["column_name"],
+            resolution=res,
+        )
+        
+        out_grid["Zmin"].rio.to_raster(outTIF)
+        print(f'Structures burned into {outTIF}')
+        
+        return out_grid
     # def getTNRISLiDAR(regionShp,toPth):
 try:
     import regionmask
@@ -1351,8 +1476,11 @@ except Exception as e:
         print('WARNING: ',e)
         print('Optional dependency for clipping ND datasets: shp.nd.clip')
 class nd():
-    def clip(ds,clipVec):
-        '''nd dataset, must have latitude, longitude dims'''
+    def clip(ds,clipVec,xdim='longitude',ydim='latitude',chunkIt=False):
+        '''nd dataset, must have latitude, longitude dims\n
+        can be named xdim,ydim but MUST be in EPSG:4326 TODO attempt rioxarray to crs if not?\n
+        if chunkIt, will chunk along time dim as 1
+        '''
         print('✂️ Clip to region ✂️')
 
         g='geometry'
@@ -1363,21 +1491,22 @@ class nd():
         reg4 = regionmask.Regions([reg],name='Region',names=['region'])
         # reg4.plot(label="abbrev")
 
-        mask=reg4.mask(ds.longitude,ds.latitude)
+        mask=reg4.mask(ds[xdim],ds[ydim])
 
         clpd = ds.where(mask==0)
 
-        assert len(clpd.where(clpd.depth!= np.NaN).latitude)>0, f'ERROR: data outside of clip mask {clipVec}'
+        # assert len(clpd.where(clpd.depth!= np.NaN)[xdim])>0, f'ERROR: data outside of clip mask {clipVec}'
 
 
         xmin,ymin,xmax,ymax = reg.bounds
+        print(reg.bounds)
 
         wraplon = lambda lon:lon if lon>0 else lon+360
 
         xmin,xmax=[wraplon(x) for x in (xmin,xmax)]
 
         #regionmask leaves the same boundary of NaNs, perform bbox clip:
-        clpd = clpd.sortby('longitude').sel(longitude=slice(xmin,xmax)).sortby('latitude').sel(latitude=slice(ymin,ymax))
+        clpd = clpd.sortby(xdim).sel( {xdim:slice(xmin,xmax)} ).sortby(ydim).sel( {ydim:slice(ymin,ymax)} )
 
         # try:
         #     # Still not implemented:
@@ -1388,14 +1517,62 @@ class nd():
 
         # clpd=clpd.dropna('longitude',how='all').dropna('latitude',how='all')
         # progress(clpd)
-        if 'time' in ds.dims:
-            clpd=clpd.chunk({'time':1,'latitude':-1,'longitude':-1})
+        if 'time' in ds.dims and chunkIt:
+            clpd=clpd.chunk({'time':1,ydim:-1,xdim:-1})
 
         # forplot = downsamp(clpd)
         # forplot.depth.plot(robust=True)
 
-        print(f'Clipped size decreased to {np.round(np.abs(clpd.nbytes/ds.nbytes)*100,1)}% of original')
+        print(f'Clipped size decreased to {np.round(np.abs(clpd.nbytes/ds.nbytes)*100,2)}% of original')
         return clpd
+    def IDW(needlesGDF,haystackDA,xname='x',yname='y',tname='time',k=3,p=1):
+        '''\n
+        haystackDA: data array to sample at 
+        samples indices from inverse distance weighted '''
+        ptsGDF = needlesGDF
+        if ptsGDF.type.iloc[0]!='Point':
+            raise TypeError(f'needlesGDF should be Point type, instead received {ptsGDF.type.iloc[0]}. Consider using GDF.centroid or shp.gp.extractVerts(GDF) to convert to points')
+        ds = haystackDA
+        if not isinstance(ds,xr.DataArray):
+            raise TypeError(f'haystackDA needs to be xr.DataArray, instead received {type(ds)}. Select a data var if needed before passing to IDW')
+        coords = np.column_stack((ds[xname].values,ds[yname].values))
+        
+        btree = KDTree(coords)
+
+        BCptarray = np.column_stack([ptsGDF.x.to_numpy(),ptsGDF.y.to_numpy()])
+        
+        dist,c = btree.query(BCptarray,k=k) #nearest neighbor's node index
+        # print('dist',dist)
+        d = np.power(dist.astype(float),-1) #butt ugly but SHOULD be vectorized, human readable version: d = 1/dist
+        d = np.power(d,p) #(1/dist)^p
+        del dist
+        
+        cflat = c.flatten()
+        cflat
+
+        # loading the full thing into np because
+        # https://github.com/pydata/xarray/issues/2799
+        v = ds.values
+        v.shape
+        timeidx = v.shape.index(ds.dims[tname])
+        assert timeidx==0, 'dataset dim order different than expected'
+        tsarray = v[:,c]
+        tsarray.shape
+        del v
+        tsda = xr.DataArray(tsarray, dims=('time','pt','k'))
+        tsda
+        del tsarray
+        tsda['time'] = ds[tname]
+        tsda.attrs = ds.attrs
+        tsda
+        assert len(tsda['pt'])==len(ptsGDF), tsda
+        assert len(tsda['k'])==k,tsda
+
+        weights = xr.DataArray(d, dims=("pt","k"))
+        assert d.shape[1]==k
+        assert d.shape[0]==len(ptsGDF)
+        w8ed = tsda.weighted(weights).mean(dim='k')
+        return w8ed
 
 class xzib():
     '''QGIS exhibit utils'''
@@ -1481,3 +1658,4 @@ class xzib():
         outpkg = pth/f'{stem}.gpkg'
         gdf[colz].to_file(outpkg,driver='GPKG')
         print(f'Exported atlas layer to {outpkg}')
+
