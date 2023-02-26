@@ -1388,8 +1388,8 @@ class rast():
         
         mins = []
         for i in range(len(bldgs)):
-            prog(i,len(bldgs),f'Finding low points of buildings in {shppth}')
-            clpd = shp.rast.clip(tif,bldgs.iloc[[i]])
+            prog(i,len(bldgs),f'Finding low points of buildings in {"shppth"}')
+            clpd = rast.clip(tif,bldgs.iloc[[i]])
             minn = clpd.where(clpd==clpd.min())
             mins += [minn]
         
@@ -1527,9 +1527,16 @@ class nd():
         return clpd
     def IDW(needlesGDF,haystackDA,xname='x',yname='y',tname='time',k=3,p=1):
         '''\n
-        haystackDA: data array to sample at 
-        samples indices from inverse distance weighted '''
-        ptsGDF = needlesGDF
+        haystackDA: data array to sample at, \n
+        orthogonal multidimensional timeseries representation:\n
+        dims=(station,tname), coords = (tname,xname,yname)\n
+        needlesGDF: Point type GDF, geoseries or Path\n
+        samples indices from inverse distance weighted aggregation using k nearest neighbors with distance to the power -p\n
+        returns da with attr copied from haystackDA, dims (tname,needlesGDF.index.name), with coords (tname,needlesGDF.index.name)\n
+        .to_pandas() can be applied to result
+        '''
+        ptsGDF = gp.asGDF(needlesGDF)
+        
         if ptsGDF.type.iloc[0]!='Point':
             raise TypeError(f'needlesGDF should be Point type, instead received {ptsGDF.type.iloc[0]}. Consider using GDF.centroid or shp.gp.extractVerts(GDF) to convert to points')
         ds = haystackDA
@@ -1539,7 +1546,8 @@ class nd():
         
         btree = KDTree(coords)
 
-        BCptarray = np.column_stack([ptsGDF.x.to_numpy(),ptsGDF.y.to_numpy()])
+        ptsgeo = ptsGDF[g] if isinstance(ptsGDF,gpd.GeoDataFrame) else ptsGDF
+        BCptarray = np.column_stack([ptsgeo.x.to_numpy(),ptsgeo.y.to_numpy()])
         
         dist,c = btree.query(BCptarray,k=k) #nearest neighbor's node index
         # print('dist',dist)
@@ -1554,21 +1562,25 @@ class nd():
         # https://github.com/pydata/xarray/issues/2799
         v = ds.values
         v.shape
-        timeidx = v.shape.index(ds.dims[tname])
+        timeidx = v.shape.index( len(ds[tname]) )
         assert timeidx==0, 'dataset dim order different than expected'
         tsarray = v[:,c]
         tsarray.shape
         del v
-        tsda = xr.DataArray(tsarray, dims=('time','pt','k'))
+        sta = ptsGDF.index.name if ptsGDF.index.name else 'pt'
+        tsda = xr.DataArray(tsarray, dims=('time',sta,'k'))
         tsda
         del tsarray
         tsda['time'] = ds[tname]
         tsda.attrs = ds.attrs
+        if not isinstance(ptsGDF.index,pd.RangeIndex):
+            # assign coords only if incoming index actually has coords
+            tsda = tsda.assign_coords({sta:(sta,ptsGDF.index)})
         tsda
-        assert len(tsda['pt'])==len(ptsGDF), tsda
+        assert len(tsda[sta])==len(ptsGDF), tsda
         assert len(tsda['k'])==k,tsda
 
-        weights = xr.DataArray(d, dims=("pt","k"))
+        weights = xr.DataArray(d, dims=(sta,"k"))
         assert d.shape[1]==k
         assert d.shape[0]==len(ptsGDF)
         w8ed = tsda.weighted(weights).mean(dim='k')
