@@ -112,7 +112,14 @@ def LinetoList(myLineString,keepZ=False,emptyIsOK=True,noneIsOK=False):
     if not keepZ and len(xy[0])==3: #has Z
         xy = [j[:2] for j in xy] 
     return xy
-# from osgeo import ogr
+def intersect_line_poly(line,poly):
+    intersection = poly.exterior.intersection(line)
+    if intersection.is_empty:
+        print(f"WARNING: shapes don't intersect")
+    elif intersection.geom_type.startswith('Multi') or intersection.geom_type == 'GeometryCollection':
+        return list(intersection.geoms)
+    else:
+        return [intersection]
 from shapely.wkt import loads
 # def shpDensify(geom,maxVertexDist):
 #     '''gdf['geometry'] = gdf['geometry'].map(shpDensify,2)'''
@@ -135,6 +142,53 @@ def filterPts(line,n,byDist=False):
         return LineString( 
             [line.interpolate(i/(n-1),normalized=True) for i in range(n)]
             )
+def insertVerts(poly,insertNverts):
+    '''
+    insert {insertNverts: int} dummy vertices in a polygon such that it has the same area\n
+    TODO linestring etc
+    '''
+    pts = np.array(poly.boundary.coords)
+    pts
+    i = int(len(pts)/2)
+    newpts = np.array(filterPts(LineString(pts[i:i+2]),insertNverts+2).coords)
+    newpts
+    # trim ends 
+    newpts = newpts[1:-1]
+    newpts
+    midpt = np.mean(pts[i:i+2],axis=0)
+    midpt
+    np.insert(pts,i+1,newpts,axis=0)
+    pts = np.insert(pts,i+1,newpts,axis=0)
+    pts
+    newpoly = Polygon(pts)
+    newpoly
+    assert np.isclose(newpoly.area , poly.area), (newpoly.area , poly.area)
+    return newpoly
+
+# angles
+def wrapAngle360(lon):
+    """wrap angle to `[0, 360[`."""
+    lon = np.array(lon)
+    return np.mod(lon, 360)
+def wrapAngle180(lon):
+    """wrap angle to `[-180, 180[`."""
+    lon = np.array(lon)
+    sel = (lon < -180) | (180 <= lon)
+    lon[sel] = wrapAngle360(lon[sel] + 180) - 180
+    return lon
+def fromAzimuth(a,azimuth):
+    '''
+    converts cartesian coords to absolute degree difference from azimuth
+    '''
+    a = np.array(a)
+    b = a-azimuth
+    b = np.abs(b)
+    # np.mod(lon, 360)
+    b = wrapAngle180(b)
+    # if b>180:
+        # b-=360
+    b = np.abs(b)
+    return b
 # def substring(geom, start_dist, end_dist, normalized=False):
 #     """available in shapely 1.7! shapely.ops.substring()\n
 #     Return a line segment between specified distances along a linear geometry.
@@ -221,7 +275,6 @@ def dropZ(geom,output_dimension=2):
     return wkb.loads(wkb.dumps(geom, output_dimension=output_dimension))
 from shapely.ops import linemerge
 from geopandas.testing import assert_geodataframe_equal
-
 
 class gp():
     '''geopandas widgets\n
@@ -405,6 +458,133 @@ class gp():
         if outShapefile:
             inLines.to_file(outShapefile)
         return inLines
+    def interpLines(linesGDF,i,npts=150):
+        '''
+        from i (0-1), returns a new linestring interpolated from linesGDF features\n
+        The first line in linesGDF must be 0. 1 will be the furthest from this\n
+        npts: filter each line in linesGDF to npts\n
+        ALL LINES MUST BE DRAWN IN THE SAME DIRECTION\n
+        '''
+        assert i>=0
+        assert i<=1
+        opts = gp.asGDF(linesGDF)
+        assert opts.type[0]=='LineString', f'{opts.type[0]} not an acceptable input. Please run multiparts to singleparts if necessary'
+        opts=opts.reset_index(drop=True) # necessary for some reason
+
+        opts = gp.FilterPts(opts,npts)
+        lne = opts.iloc[0][g]
+        assert len(lne.coords)==npts
+
+        pts = opts[g].map(lambda lne: 
+            [Point(pt) for pt in lne.coords]
+        # list(lne.coords)
+        )
+        
+        # assign each line a distance i from 0 to 1
+        pt1 = pts.str[0]
+        pt11 = pt1.iloc[0]
+        dist = pt1.map(lambda pt: pt.distance(pt11) )
+        opts['i']= dist/dist.max()
+        # opts = opts.sort_values('i') # THIS SCREWS THE WHOLE THING UP!
+
+        bnds = xpd.findNeighbors(opts,'i',i)
+        if len(bnds)==1:
+            return bnds[g].iloc[0]
+        # normalize i between the upper and lower bound to interp between them using shapely normalized
+        dn,up = bnds['i'].to_list()
+        ii = (i-dn)/(up - dn)
+
+        # only use the bounding lines to interp
+        pts = pts.iloc[bnds.index]
+
+        ptlist = pts.to_list()
+        # print(np.array(ptlist).shape)
+        da = xr.DataArray(np.array(ptlist),dims=('i','x'))
+        da=da.assign_coords({'i':np.linspace(0,1,len(da['i'])),
+                        # 'crd':['x','y']
+                        })
+
+        # transpose to get transects
+        df = da.to_dataframe(name='pt')
+        df = df.reset_index().set_index(['x','i']).sort_index()
+        transects = df.groupby(level=0).apply(lambda pts:LineString(pts['pt'].to_list()))
+        return LineString(transects.map(lambda transect:transect.interpolate(ii,normalized=True)).to_list())
+
+    def discretizeLine(linegdf,lineCoverage=0.8):
+        '''
+         Discretize the line into npoints segments covering lineCoverage*100 %
+        '''
+        # Discretize
+        self.geo = RASgeo(self.gfile,['bcs'])
+        bc = self.geo.bcs[self.geo.bcs['Name']==self.bcName]
+        assert not bc.empty, f'ERROR: {self.bcName} not found in boundary conditions \n{self.geo.bcs}\n of {self.gfile}. Please use the option `insertBC`. No geometry files changed'
+
+        bc.to_file(self.BCvec)
+        print(f'Original full BC line bounced to {self.BCvec}')
+
+
+        bcfilt = shp.gp.FilterPts(bc,self.npoints)
+        xy = np.array(bcfilt[g].iloc[0].coords)
+        BCpts = gpd.GeoSeries(gpd.points_from_xy(xy[:,0],xy[:,1]),crs=bc.crs)
+        
+        # subdivide BC line
+        line = bc[g].iloc[0]
+
+        cutpts = BCpts.iloc[1:-1]
+
+        # s is the spacing between pts
+        s = 1/(self.npoints-1)
+
+        # midpts are the normalized distances at the midpts between the adcirc sample pts, also spaced {s} apart
+        midpts = np.arange(s/2,1+s/2,s)
+        assert abs(1-s/2 - midpts[-1])<0.01, f'INTERNAL ERROR: midpts not computed correctly'
+        
+        assert self.lineCoverage<=1
+        assert self.lineCoverage>0
+        # cut buffer: dist to offset on the left and right of each midpt to get the actual cut points, based on self.lineCoverage
+        cutbuff = (1-self.lineCoverage)*s/2
+        
+        # cut points are ...
+        cutpts = np.array(list(zip(midpts-cutbuff,midpts+cutbuff))).flatten()
+        
+        # add 0,1 (ends) to cutpts to get end pts of each line segment
+        endpts = np.array([0]+list(cutpts)+[1])
+        
+        # group each two endpts to create a line segment
+        segments = list(endpts.reshape((int(len(endpts)/2),2)))
+        segmnts = [shp.cutPiece(line,seg[0],seg[1],True) for seg in segments]
+        segs = gpd.GeoDataFrame(geometry=segmnts,crs=bc.crs)
+        
+        # write back to geo
+        segs.index = range(len(segs))
+        bc.index = range(len(bc))
+        cols = bc.columns.drop(g).to_list()
+        segs[cols] = bc[cols]
+        segs[cols]=segs[cols].fillna(method='ffill').fillna(method='bfill')
+        segs['Name'] = segs['Name'].str.cat(list(map(str,range(len(segs)))))
+
+        bcs = self.geo.bcs
+        self.geo.bcs = pd.concat([bcs[bcs.Name!=self.bcName] , segs])
+        if outFullBCvec:
+            self.geo.bcs.to_file(outFullBCvec)
+            print(f'BC lines with {self.npoints} discretized DS BC {self.bcName} bounced to\n{outFullBCvec}')
+        self.geo.writeBCs()
+        self.geo.hdf.close()
+
+        # del'd only p file
+        # HDF5-DIAG: Error detected in HDF5 (1.10.6) thread 17756:
+        #   #000: D:\build\HDF5\1.10.6\hdf5-1.10.6\src\H5Pdcpl.c line 2090 in H5Pget_chunk(): not a chunked storage layout
+        #     major: Invalid arguments to routine
+        #     minor: Bad value
+        # HDF5-DIAG: Error detected in HDF5 (1.10.6) thread 17756:
+        #   #000: D:\build\HDF5\1.10.6\hdf5-1.10.6\src\H5Pdcpl.c line 2090 in H5Pget_chunk(): not a chunked storage layout
+        #     major: Invalid arguments to routine
+        #     minor: Bad value
+        # HDF5-DIAG: Error detected in HDF5 (1.10.6) thread 17756:
+        #   #000: D:\build\HDF5\1.10.6\hdf5-1.10.6\src\H5Pdcpl.c line 2090 in H5Pget_chunk(): not a chunked storage layout
+        #     major: Invalid arguments to routine
+        #     minor: Bad value
+    
     # def extractVerts(gdf):
     #     '''
     #     Extracts vertices of 
@@ -577,6 +757,21 @@ class gp():
                 i *= 2
             mergd = joind
         return mergd
+    def nearestSelf(GDF,norm=False):
+        '''returns a GDF with a dist col with the dist of each feature to its nearest neighbor within the GDF. \n
+        if norm: normalize so the max dist will be 1 gdf['dist'] = gdf['dist']/gdf.dist.max()\n
+        this tells how closely together points may be clustered, and can be used to size features in a GIS GUI\n'''
+        d = gp.asGDF(GDF)
+        if 'dist' in d.columns:
+            print(f'WARNING: {GDF} already has a dist field, skipping...')
+            return None
+        nn = gp.nearest(d,d,k=2)
+        nn = nn[nn.dist>0]
+        d['dist'] = nn['dist']
+        if norm:
+            #  normalize so the max dist will be 1 
+            d['dist'] = d['dist']/d['dist'].max()
+        return d
     def extractVerts(lineGeoSer):
         ''''''
         verts = lineGeoSer.apply(lambda ln: [Point(pt) for pt in ln.coords])
@@ -922,8 +1117,32 @@ class gp():
 
         return lineGDF
 
+    def merge_vector_files(file_paths, output_path):
+        """
+        Merges touching polygons from multiple vector files into a single output file.
+        
+        Parameters:
+        - file_paths: Iterable of paths to the vector files.
+        - output_path: Path for the output merged vector file.
+        """
+        # Read each vector file into a GeoDataFrame and store in a list
+        gdfs = [gp.asGDF(path) for path in file_paths]
+        
+        # Concatenate all GeoDataFrames into a single one
+        combined_gdf = gpd.GeoDataFrame(pd.concat(gdfs, ignore_index=True))
+        
+        final_gdf = combined_gdf.dissolve().explode(index_parts=False).reset_index(drop=True)
+        
+        # Save the resulting GeoDataFrame to the specified output file
+        final_gdf.to_file(output_path)
 
 
+
+try:
+    from osgeo import gdal, ogr
+except Exception as e:
+    if printImportWarnings:
+        print('WARNING: ',e)
 class rast():
     def asRioxda(rioxdaORtifpth,**kwargs):
         if isinstance(rioxdaORtifpth,PurePath):
@@ -956,7 +1175,6 @@ class rast():
             xyz = xyz.isel(band=0) if 'band' in xyz.dims else xyz
             return xyz
 
-
         rioxda = rast.asRioxda(rioxda)
         gdf = gdf.to_crs(rioxda.rio.crs)
         pts = gdf[g].copy() if isinstance(gdf,gpd.GeoDataFrame) else gdf.copy()
@@ -972,6 +1190,93 @@ class rast():
         z = pts.map(lambda gs: _sampleDA(rioxda,gs,xydims).values)
         z.name = 'Z'
         return z
+    def contours(TIF, outGPKG, interval=1, contours=None, elevField='Z' ):
+        """
+        Generate contour lines from a raster file at a given interval.\n
+        \n
+        Args:\n
+            TIF (Path): The file path of the input raster file.\n
+            out_gpkg (Path): The file path of the output geopackage.\n
+            interval (float): The interval at which to generate contour lines.\n
+            contours (list or np.array): A list or numpy array of specific contour elevations.\n
+        \n
+        Returns:\n
+            None\n
+        """
+        outGPKG.parent.mkdir(parents=True,exist_ok=True) # otherwise GDAL will throw useless pointer errors if it doesn't exist
+        outGPKG.unlink(missing_ok=True) # otherwise GDAL's failure will be silent but deadly
+        raster_path=str(TIF)
+        out_GPKG=str(outGPKG)
+        # Create the output file
+        drv = ogr.GetDriverByName('GPKG')
+
+        if os.path.exists(out_GPKG):
+            drv.DeleteDataSource(out_GPKG)
+
+        dst_ds = drv.CreateDataSource(out_GPKG)
+        if dst_ds is None:
+            print(f"ERROR: Could not create output file. Check write permission for {out_GPKG}")
+            return None
+        dst_layer = dst_ds.CreateLayer(outGPKG.stem)
+
+        # Open the raster file
+        raster = gdal.Open(raster_path)
+
+        # Define new field for elevation
+        field_defn = ogr.FieldDefn(elevField, ogr.OFTReal)
+        dst_layer.CreateField(field_defn)
+
+        # Get the index of the elevation field
+        elev_field_index = dst_layer.FindFieldIndex(elevField, True)
+        # Generate contours
+        if contours:
+            # Generate contours at specific levels
+            gdal.ContourGenerate(raster.GetRasterBand(1), 0, contours[0], contours, len(contours), 0, dst_layer, elev_field_index, -1)
+        else:
+            # Generate contours at a given interval
+            gdal.ContourGenerate(raster.GetRasterBand(1), interval, 0, [], 0, 0, dst_layer, elev_field_index, -1)
+        dst_ds = None
+    def resamp(tif,outtif='infer',res=0.295):
+        '''
+        tif: Path to tif, or rioxds\n
+        outtif: Path to save resampled tif or None\n
+        res: resolution in crs units\n
+        returns resampled rioxarray\n
+        '''
+        # big = rxr.open_rasterio(tif)
+        big = rast.asRioxds(tif)
+        # xscale = np.abs(float(big.x[1]-big.x[0]))
+        # yscale = np.abs(float(big.y[1]-big.y[0]))
+        # xfreq = int(np.round(res/xscale))
+        # yfreq = int(np.round(res/yscale))
+        # xfreq
+        unit = big.rio.crs.linear_units
+        assert unit in {'meter', 'metre'}
+        res = 0.295
+        # Downscale to cell  size of res
+        small = big.rio.reproject(big.rio.crs, resolution=(res, res))
+        del big
+        # small = big.resample({'x':xfreq}).mean()
+        
+        assert np.isclose(
+            np.abs(small.x[1]-small.x[0]) ,
+            np.abs(small.y[1]-small.y[0]) ,
+            res
+        )
+        if outtif:
+            tif19 = pth/f'{tif.stem}_resamp.tif' if outtif == 'infer' else outtif
+            small.rio.to_raster(tif19)
+            print(f'Bounced to {tif19}')
+        return small
+    def get_patch_transform(original_transform, x_offset, y_offset):
+        """
+        Adjust the original transform for a specific patch,
+        based on the offsets in the x and y directions.
+        """
+        new_transform = rasterio.Affine(original_transform.a, original_transform.b, original_transform.c + (original_transform.a * x_offset),
+                                        original_transform.d, original_transform.e, original_transform.f + (original_transform.e * y_offset))
+        return new_transform
+
     def ZgivenXY(linestrng,rasta):
         '''returns an np array of Z vals given a linestring
         rasta is .tif Path, reads in with xarray'''
@@ -1033,7 +1338,7 @@ class rast():
         assert minn<=float(rioxda.min()), f'ERROR: min {float(rioxda.min())} outside lower bound of {minn}'
         assert maxx>=float(rioxda.max()), f'ERROR: max {float(rioxda.max())} outside upper bound of {maxx}'
     # @timeit
-    def clip(rioxda,clip_GDF,stripNAs=True):
+    def clip(rioxDA,clip_GDF,stripNAs=True):
         '''
         rioxda: raster as rioxarray ds\n
         clipGDF: polygon GDF (or series TODO) to clip w/\n
@@ -1043,7 +1348,7 @@ class rast():
         # print('..')
         # # print(rioxda.rio.crs.wkt)
         # print('...')
-        rioxda = rast.asRioxda(rioxda)
+        rioxda = rast.asRioxda(rioxDA)
         clipGDF = gp.asGDF(clip_GDF)
         rastCRS = rioxda.rio.crs
         # rastCRS = pyproj.CRS.from_user_input(rioxda.rio.crs)
@@ -1059,7 +1364,9 @@ class rast():
         
         # print(rioxda.rio.bounds())
         rastbnds = box(*rioxda.rio.bounds())
-        assert Polygon(xybbox).overlaps(rastbnds), f'ERROR: areaGDF does not lie within bounds of rioxda raster\n\n{clipGDF}, \nPossible projection issue\nrioxdatif crs: {rastCRS}\nGDF crs: {clipGDF.crs}'
+        
+        if not Polygon(xybbox).overlaps(rastbnds):
+            print( f'ERROR: areaGDF does not lie within bounds of rioxda raster\n\n{clipGDF}, \nPossible projection issue\nrioxdatif crs: {rastCRS}\nGDF crs: {clipGDF.crs}' )
         
         # rioxda.rio.write_nodata(128, inplace=True)
         # rioxda['nodatavals'] = (128)
@@ -1081,6 +1388,56 @@ class rast():
         if stripNAs:
             clipdTerr=clipdTerr.where(clipdTerr != clipdTerr.attrs['_FillValue'])
         return clipdTerr
+
+    def toTerrariumRGB(terrtif,outtif,
+                       floattype=np.float32,
+                    #    inttype=rasterio.uint8
+                       ):
+        '''
+        for maplibre-gl terrain\n
+        be sure to tile after using tilemill or QGIS Qtiles\n
+        if you hit memory issues:\n
+        resample input terrtif first. 
+        hint: Check your max zoom level and see what res you're actually getting anyway\n
+        floattype could be downscaled ie np.float16 ?\n
+        inttype is only for the RGB 0-255 bands that get written to the output, probably shouldn't change
+        '''
+
+        # #TODO set missing data to 0 first:
+        # terr = rxr.open_rasterio(terrpth)
+        # terr = rast.setNodataAsNaN(terr)
+        # terr = terr.fillna(0)
+        # terr.attrs['_FillValue'] = -9999
+        # terr.rio.to_raster()
+
+        terrpth=terrtif
+        outterrarium = outtif
+        with rasterio.Env(CHECK_DISK_FREE_SPACE =False):
+            with rasterio.open(terrpth) as src:
+                dem = src.read(1)
+                # print(dem.shape)
+                r = np.zeros(dem.shape,dtype=floattype)
+                g = np.zeros(dem.shape,dtype=floattype)
+                b = np.zeros(dem.shape,dtype=floattype)
+
+                v = dem + 32768
+                r += np.floor(v / 256.0)
+                g += np.floor(v % 256.0)
+                b += np.floor((v - np.floor(v)) * 256.0)
+
+                meta = src.profile
+                meta["dtype"] = inttype
+                meta["nodata"] = None
+                meta["count"] = 3
+                print('writing...')
+                with rasterio.open(outterrarium, 'w', **meta) as dst:
+                    print('red')
+                    dst.write_band(1, r.astype(inttype))
+                    print('blue')
+                    dst.write_band(2, g.astype(inttype))
+                    print('green')
+                    dst.write_band(3, b.astype(inttype))
+        print(f'Done writing terrarium RGB to {outtif}')
     def masquerade(E,thresh):
         return np.greater(E,thresh)*1
     def masq(a,thresh):
@@ -1388,8 +1745,8 @@ class rast():
         
         mins = []
         for i in range(len(bldgs)):
-            prog(i,len(bldgs),f'Finding low points of buildings in {shppth}')
-            clpd = shp.rast.clip(tif,bldgs.iloc[[i]])
+            prog(i,len(bldgs),f'Finding low points of buildings in {"shppth"}')
+            clpd = rast.clip(tif,bldgs.iloc[[i]])
             minn = clpd.where(clpd==clpd.min())
             mins += [minn]
         
@@ -1476,7 +1833,7 @@ except Exception as e:
         print('WARNING: ',e)
         print('Optional dependency for clipping ND datasets: shp.nd.clip')
 class nd():
-    def clip(ds,clipVec,xdim='longitude',ydim='latitude',chunkIt=False):
+    def clip(ds,clipVec,xdim='longitude',ydim='latitude',chunkIt=False,wraplon=True):
         '''nd dataset, must have latitude, longitude dims\n
         can be named xdim,ydim but MUST be in EPSG:4326 TODO attempt rioxarray to crs if not?\n
         if chunkIt, will chunk along time dim as 1
@@ -1500,10 +1857,9 @@ class nd():
 
         xmin,ymin,xmax,ymax = reg.bounds
         print(reg.bounds)
-
-        wraplon = lambda lon:lon if lon>0 else lon+360
-
-        xmin,xmax=[wraplon(x) for x in (xmin,xmax)]
+        if wraplon:
+            wraplonf = lambda lon:lon if lon>0 else lon+360
+            xmin,xmax=[wraplonf(x) for x in (xmin,xmax)]
 
         #regionmask leaves the same boundary of NaNs, perform bbox clip:
         clpd = clpd.sortby(xdim).sel( {xdim:slice(xmin,xmax)} ).sortby(ydim).sel( {ydim:slice(ymin,ymax)} )
@@ -1527,9 +1883,16 @@ class nd():
         return clpd
     def IDW(needlesGDF,haystackDA,xname='x',yname='y',tname='time',k=3,p=1):
         '''\n
-        haystackDA: data array to sample at 
-        samples indices from inverse distance weighted '''
-        ptsGDF = needlesGDF
+        haystackDA: data array to sample at, \n
+        orthogonal multidimensional timeseries representation:\n
+        dims=(station,tname), coords = (tname,xname,yname)\n
+        needlesGDF: Point type GDF, geoseries or Path\n
+        samples indices from inverse distance weighted aggregation using k nearest neighbors with distance to the power -p\n
+        returns da with attr copied from haystackDA, dims (tname,needlesGDF.index.name), with coords (tname,needlesGDF.index.name)\n
+        .to_pandas() can be applied to result
+        '''
+        ptsGDF = gp.asGDF(needlesGDF)
+        
         if ptsGDF.type.iloc[0]!='Point':
             raise TypeError(f'needlesGDF should be Point type, instead received {ptsGDF.type.iloc[0]}. Consider using GDF.centroid or shp.gp.extractVerts(GDF) to convert to points')
         ds = haystackDA
@@ -1539,7 +1902,8 @@ class nd():
         
         btree = KDTree(coords)
 
-        BCptarray = np.column_stack([ptsGDF.x.to_numpy(),ptsGDF.y.to_numpy()])
+        ptsgeo = ptsGDF[g] if isinstance(ptsGDF,gpd.GeoDataFrame) else ptsGDF
+        BCptarray = np.column_stack([ptsgeo.x.to_numpy(),ptsgeo.y.to_numpy()])
         
         dist,c = btree.query(BCptarray,k=k) #nearest neighbor's node index
         # print('dist',dist)
@@ -1554,25 +1918,109 @@ class nd():
         # https://github.com/pydata/xarray/issues/2799
         v = ds.values
         v.shape
-        timeidx = v.shape.index(ds.dims[tname])
+        timeidx = v.shape.index( len(ds[tname]) )
         assert timeidx==0, 'dataset dim order different than expected'
         tsarray = v[:,c]
         tsarray.shape
         del v
-        tsda = xr.DataArray(tsarray, dims=('time','pt','k'))
+        sta = ptsGDF.index.name if ptsGDF.index.name else 'pt'
+        tsda = xr.DataArray(tsarray, dims=('time',sta,'k'))
         tsda
         del tsarray
-        tsda['time'] = ds[tname]
         tsda.attrs = ds.attrs
+        if not isinstance(ptsGDF.index,pd.RangeIndex):
+            # assign coords only if incoming index actually has coords
+            tsda = tsda.assign_coords({sta:(sta,ptsGDF.index)})
         tsda
-        assert len(tsda['pt'])==len(ptsGDF), tsda
+        assert len(tsda[sta])==len(ptsGDF), tsda
         assert len(tsda['k'])==k,tsda
 
-        weights = xr.DataArray(d, dims=("pt","k"))
+        weights = xr.DataArray(d, dims=(sta,"k"))
         assert d.shape[1]==k
         assert d.shape[0]==len(ptsGDF)
         w8ed = tsda.weighted(weights).mean(dim='k')
         return w8ed
+    def snap2grid(ds1,ds2,xdim='longitude',ydim='latitude'):
+        '''Snap the lat/lon values of the first dataset to the nearest lat/lon values of the second dataset'''
+        # Create a KDTree from the lat/lon values of the second dataset
+        ys = ds2[ydim].values
+        tree = cKDTree(ys.reshape((len(ys),1)))
+        # Query the tree for the nearest lat/lon values from the first dataset
+        y1s = ds1[ydim].values
+        dist, idx = tree.query(y1s.reshape((len(y1s),1)))
+        # Assign the lat/lon values from the second dataset to the first dataset
+        ds1[ydim] = ds2[ydim].isel({ydim:idx})
+
+        # Repeat for the longitude values
+        xs = ds2[xdim].values
+        tree = cKDTree(xs.reshape((len(xs),1)))
+        x1s = ds1[xdim].values
+        dist, idx = tree.query(x1s.reshape((len(x1s),1)))
+        ds1[xdim] = ds2[xdim].isel({xdim:idx})
+
+        assert not set(ds1[ydim].values) - set(ds2[ydim].values)
+        assert not set(ds1[xdim].values) - set(ds2[xdim].values)
+
+        return ds1
+    def buffer(ds, degbuff, londim='longitude', latdim='latitude',method=None,fill_value=np.nan,**kwargs):
+        """
+        Expands the latitude and longitude dimensions of an xarray dataset by a given buffer, 
+        adding new coordinates at the same regular interval without changing any current indices.
+
+        Parameters
+        ----------
+        ds : xarray.Dataset
+            The input xarray dataset containing latitude and longitude dimensions.
+        degbuff : float
+            The buffer size in degrees to be added to all sides of the latitude and longitude ranges.
+        londim : str, optional
+            The name of the longitude dimension in the dataset (default is 'longitude').
+        latdim : str, optional
+            The name of the latitude dimension in the dataset (default is 'latitude').
+
+        Returns
+        -------
+        xarray.Dataset
+            A new xarray dataset with expanded latitude and longitude dimensions, where new 
+            coordinates are filled with NaN values.
+
+        Notes
+        -----
+        The function retains the original indices in both latitude and longitude dimensions, and 
+        only adds new indices to extend the dataset by the given buffer.
+        """
+        lat_step = np.abs(ds[latdim][1] - ds[latdim][0])
+        lon_step = np.abs(ds[londim][1] - ds[londim][0])
+
+        new_lat_buffer = np.arange(ds[latdim].min() - degbuff, ds[latdim].min(), lat_step)
+        new_lat_buffer = np.append(new_lat_buffer, np.arange(ds[latdim].max() + lat_step, ds[latdim].max() + degbuff + lat_step, lat_step))
+        new_lon_buffer = np.arange(ds[londim].min() - degbuff, ds[londim].min(), lon_step)
+        new_lon_buffer = np.append(new_lon_buffer, np.arange(ds[londim].max() + lon_step, ds[londim].max() + degbuff + lon_step, lon_step))
+
+        new_lat = np.union1d(ds[latdim], new_lat_buffer)
+        new_lon = np.union1d(ds[londim], new_lon_buffer)
+
+        ds_expanded = ds.reindex({latdim: new_lat, londim: new_lon},
+            method=method,fill_value=fill_value,**kwargs )
+        
+        return ds_expanded
+    def boundDiff(ds,gdf,xdim='longitude',ydim='latitude'):
+        gdf_bounds = gdf.to_crs('EPSG:4326').total_bounds  # Returns [minx, miny, maxx, maxy]
+
+        # Unpack gdf_bounds for easier access
+        minx, miny, maxx, maxy = gdf_bounds
+
+        t = ds
+        # Calculate the positive differences between the bounds of gdf and t
+        diffz = [
+            max(0, t[xdim].min().values - minx),  # Difference between t min longitude and gdf min longitude
+            max(0, maxx - t[xdim].max().values),  # Difference between gdf max longitude and t max longitude
+            max(0, t[ydim].min().values - miny),  # Difference between t min latitude and gdf min latitude
+            max(0, maxy - t[ydim].max().values)   # Difference between gdf max latitude and t max latitude
+        ]
+
+        return max(*diffz)
+
 
 class xzib():
     '''QGIS exhibit utils'''
@@ -1628,9 +2076,11 @@ class xzib():
         return Polygon(bbx)
     def typProd(atlasGDF,x,ExhibTypCol = 'ExhibTyp'):
         '''Exhibits are controlled by object x\n
-        the huc8's and huc10's in hucpkg will be combined, and then multiplied by each ExhibTyp (key) in x\n
+        the huc8's and huc10's in hucpkg will be combined, and then multiplied by each ExhibTyp
+         (key) in x\n
         layers and ExhibName columns will be populated by layer lists/formulas for the name\n
-        columns will get populated in the order specified, so if a dynamic column depends on another specified column, it must be added after its dependency column\n
+        columns will get populated in the order specified, so if a dynamic column depends on
+         another specified column, it must be added after its dependency column\n
         returns the updated atlasGDF (not in place)\n
         '''
         gdfs = []
